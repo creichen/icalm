@@ -1,7 +1,8 @@
+use atty::Stream;
 use clap::{Parser, Subcommand};
-use std::{collections::HashMap, fs::read_to_string};
+use std::{collections::HashMap, fs::read_to_string, io::stdin};
 use icalendar::{Calendar, CalendarComponent, Component};
-use colored::Colorize;
+//use colored::Colorize;
 
 #[derive(Parser)]
 #[command(
@@ -12,6 +13,14 @@ use colored::Colorize;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Calendar name; defaults to the first calendar name in the list of input files
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Calendar description; defaults to the first calendar description in the list of input files
+    #[arg(long)]
+    description: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -19,97 +28,173 @@ enum Commands {
     /// Concatenate and merge multiple .ics files
     Cat {
         /// Input .ics files
-        #[arg(required = true)]
+        #[arg(required = false)]
         files: Vec<String>,
-
-	/// Calendar name; defaults to the first calendar name in the list of input files
-        #[arg(long)]
-        name: Option<String>,
-
-    	/// Calendar description; defaults to the first calendar description in the list of input files
-        #[arg(long)]
-        description: Option<String>,
     },
+
+    // /// Filter ou
+    // Replace {
+    //     /// Input .ics files
+    //     #[arg(required = true)]
+    //     files: Vec<String>,
+    // },
 }
 
+/// Should the new_event replace the old_event?  Both have the same UID, and new_event was observed later.
 fn must_replace(_new_event: &icalendar::Event, _old_event: &icalendar::Event) -> bool {
     true
 }
 
-fn main() {
-    let cli = Cli::parse();
-    match &cli.command {
-	Commands::Cat { files, name, description } => {
-	    let mut output: Vec<CalendarComponent> = vec![];
-	    let mut id_map = HashMap::new();
-	    let mut cal_name: Option<String> = name.clone();
-	    let mut cal_description: Option<String> = description.clone();
-	    let mut cal_timezone = None;
+/// Should this event be preserved? (Default filter)
+fn ev_default_filter(_event: &icalendar::Event) -> bool {
+    true
+}
 
-	    for file in files {
-		let contents = read_to_string(file).unwrap();
+/// Should this event be transformed?  Return update, otherwise preserve
+fn ev_default_transform(_event: &icalendar::Event) -> Option<icalendar::Event> {
+    None
+}
 
-		let parsed_calendar: Calendar = contents.parse().unwrap();
+struct CalBuilder {
+    components: Vec<CalendarComponent>,
+    id_map: HashMap<String, usize>,
+    name: Option<String>,
+    description: Option<String>,
+    timezone: Option<String>,
+}
 
-		cal_name = cal_name.take().or(parsed_calendar.get_name().map(|s| s.to_string()));
-		cal_description = cal_description.take().or(parsed_calendar.get_description().map(|s| s.to_string()));
-		cal_timezone = cal_timezone.take().or(parsed_calendar.get_timezone().map(|s| s.to_string()));
-
-		for component in &parsed_calendar.components {
-		    if let CalendarComponent::Event(event) = component {
-			if let Some(uid) = event.get_uid() {
-			    let uid = uid.to_string();
-			    if let Some(&index) = id_map.get(&uid) {
-				// Already saw this UID?
-				let refcell = &mut output[index];
-
-				let to_replace = if let CalendarComponent::Event(old_event) = refcell {
-				    must_replace(event, &old_event)
-				} else { false };
-
-				if to_replace {
-				    *refcell = component.clone();
-				}
-			    } else {
-				// Fresh UID
-				id_map.insert(uid, output.len());
-				output.push(component.clone());
-			    }
-			} else {
-			    eprintln!("Calendar event without UID; skipping");
-			}
-		    } else {
-			output.push(component.clone());
-		    }
-
-		    // if let CalendarComponent::Event(event) = component {
-		    // 	output.push(event.clone());
-		    // 	// if let Some(summary) = event.get_summary() {
-		    // 	//     println!("Event: {}", summary);
-		    // 	// }
-		    // }
-		}
-	    }
-
-	    let mut output_cal = Calendar::new();
-	    for component in output {
-		output_cal.push(component);
-	    }
-
-	    if let Some(name) = cal_name {
-		output_cal.name(&name);
-	    }
-
-	    if let Some(description) = cal_description {
-		output_cal.description(&description);
-	    }
-
-	    if let Some(timezone) = cal_timezone {
-		output_cal.timezone(&timezone);
-	    }
-
-	    println!("{}", output_cal);
+impl CalBuilder {
+    fn new() -> Self {
+	Self {
+	    components: vec![],
+	    id_map: HashMap::new(),
+	    name: None,
+	    description: None,
+	    timezone: None,
 	}
     }
+
+    fn or_calendar(&mut self, calendar: &Calendar) {
+	self.name = self.name.take().or(calendar.get_name().map(|s| s.to_string()));
+	self.description = self.description.take().or(calendar.get_description().map(|s| s.to_string()));
+	self.timezone = self.timezone.take().or(calendar.get_timezone().map(|s| s.to_string()));
+    }
+
+    fn empty_calendar(&self) -> Calendar {
+	let mut output_cal = Calendar::new();
+
+	if let Some(ref name) = self.name {
+	    output_cal.name(&name);
+	}
+
+	if let Some(ref description) = self.description {
+	    output_cal.description(&description);
+	}
+
+	if let Some(ref timezone) = self.timezone {
+	    output_cal.timezone(&timezone);
+	}
+	return output_cal;
+    }
+
+    fn process_stdin(&mut self) {
+	let stdin = stdin();
+	let mut input = String::new();
+	for line in stdin.lines() {
+            let line = line.expect("Stdin broken");
+            // if line.trim().is_empty() {
+	    // 	continue; // Ignore empty lines
+            // }
+            input.push_str(&line);
+            input.push('\n');
+	}
+	self.process(&input);
+    }
+
+    fn process(&mut self, input: &str) {
+	if input.len() > 0 {
+	    let parsed_calendar: Calendar = input.parse().unwrap();
+
+	    self.or_calendar(&parsed_calendar);
+
+	    for component in &parsed_calendar.components {
+		if let CalendarComponent::Event(event) = component {
+
+		    if let Some(uid) = event.get_uid() {
+			let uid = uid.to_string();
+			if let Some(&index) = self.id_map.get(&uid) {
+			    // Already saw this UID?
+			    let refcell = &mut self.components[index];
+
+			    let to_replace = if let CalendarComponent::Event(old_event) = refcell {
+				must_replace(event, &old_event)
+			    } else { false };
+
+			    if to_replace {
+				*refcell = component.clone();
+			    }
+			} else {
+			    // Fresh UID
+			    self.id_map.insert(uid, self.components.len());
+			    self.components.push(component.clone());
+			}
+		    } else {
+			eprintln!("Calendar event without UID; skipping");
+		    }
+		} else {
+		    self.components.push(component.clone());
+		}
+	    }
+	}
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let mut output = CalBuilder::new();
+
+    let ev_filter = &ev_default_filter;
+    let ev_transform = &ev_default_transform;
+
+    if !atty::is(Stream::Stdin) {
+	output.process_stdin();
+    }
+
+    match &cli.command {
+	Commands::Cat { files } => {
+	    for file in files {
+		let input = read_to_string(file).unwrap();
+		output.process(&input);
+	    }
+	}
+    }
+
+    // Produce output
+
+    let mut output_cal = output.empty_calendar();
+
+    for component in output.components {
+	let retain = if let CalendarComponent::Event(_) = component {
+	    ev_filter(&component.as_event().unwrap())
+	} else { true };
+
+	if retain {
+	    let preserve = match component {
+		CalendarComponent::Event(ref ev) => {
+		    match ev_transform(&ev) {
+			None     => true,
+			Some(ev) => { output_cal.push(CalendarComponent::Event(ev));
+			false},
+		    }
+		},
+		_ => true,
+	    };
+	    if preserve {
+		output_cal.push(component);
+	    }
+	}
+    }
+
+    println!("{}", output_cal);
 }
 
