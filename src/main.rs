@@ -1,7 +1,7 @@
 use atty::Stream;
 use clap::{Parser, Subcommand};
-use std::{collections::HashMap, fs::read_to_string, io::stdin};
-use icalendar::{Calendar, CalendarComponent, Component};
+use std::{collections::{HashMap, HashSet}, fs::{read_to_string, File}, io::{stdin, Write}};
+use icalendar::{Calendar, CalendarComponent, Component, Event};
 //use colored::Colorize;
 
 #[derive(Parser)]
@@ -14,6 +14,14 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
+    /// Input file
+    #[arg(short, long)]
+    input: Option<String>,
+
+    /// Output file
+    #[arg(short, long)]
+    output: Option<String>,
+
     /// Calendar name; defaults to the first calendar name in the list of input files
     #[arg(long)]
     name: Option<String>,
@@ -21,6 +29,18 @@ struct Cli {
     /// Calendar description; defaults to the first calendar description in the list of input files
     #[arg(long)]
     description: Option<String>,
+}
+
+impl Cli {
+    fn print_calendar(&self, output_cal: &Calendar) {
+	if let Some(ref output_filename) = self.output {
+	    println!("Redirection");
+	    let mut file = File::create(output_filename).unwrap();
+	    writeln!(file, "{}", output_cal).unwrap();
+	} else {
+	    println!("{}", output_cal);
+	}
+    }
 }
 
 #[derive(Subcommand)]
@@ -32,30 +52,111 @@ enum Commands {
         files: Vec<String>,
     },
 
-    // /// Filter ou
-    // Replace {
-    //     /// Input .ics files
-    //     #[arg(required = true)]
-    //     files: Vec<String>,
-    // },
+    /// Remove the specified properties (SUMMARY, LOCATION, STATUS, ...) from all events
+    RemoveProp {
+	/// Properties to remove
+        #[arg(required = true)]
+        properties: Vec<String>,
+    },
+
+    /// Replace the value of one property by a constant string
+    SetProp {
+        /// Property to replace (e.g., "SUMMARY")
+        #[arg(required = true)]
+        property: String,
+
+        /// Value to substitute for this property
+        #[arg(required = true)]
+        value: String,
+    },
 }
 
-/// Should the new_event replace the old_event?  Both have the same UID, and new_event was observed later.
-fn must_replace(_new_event: &icalendar::Event, _old_event: &icalendar::Event) -> bool {
-    true
+// --------------------------------------------------------------------------------
+trait EventReplacementStrategy {
+    /// Should the new_event replace the old_event?  Both have the same UID, and new_event was observed later.
+    fn must_replace(&self, _new_event: &icalendar::Event, _old_event: &icalendar::Event) -> bool {
+	true
+    }
 }
 
-/// Should this event be preserved? (Default filter)
-fn ev_default_filter(_event: &icalendar::Event) -> bool {
-    true
+trait EventProcessor {
+    /// Should this event be preserved? (Default filter)
+    fn filter(&self, _event: &icalendar::Event) -> bool {
+	true
+    }
+    /// Should this event be transformed?  Return update, otherwise preserve
+    fn transform(&self, _event: &icalendar::Event) -> Option<icalendar::Event> {
+	None
+    }
 }
 
-/// Should this event be transformed?  Return update, otherwise preserve
-fn ev_default_transform(_event: &icalendar::Event) -> Option<icalendar::Event> {
-    None
+// --------------------------------------------------------------------------------
+
+struct DefaultEventReplacementStrategy {}
+impl EventReplacementStrategy for  DefaultEventReplacementStrategy {}
+
+struct DefaultEventProcessor {}
+impl EventProcessor for  DefaultEventProcessor {}
+
+// --------------------------------------------------------------------------------
+
+struct RemovePropEventProcessor<'a> {
+    remove_set: HashSet<&'a String>,
 }
 
-struct CalBuilder {
+impl<'a> RemovePropEventProcessor<'a> {
+    fn new(remove_set: HashSet<&'a String>) -> Self {
+	Self {
+	    remove_set
+	}
+    }
+}
+
+impl<'a> EventProcessor for RemovePropEventProcessor<'a> {
+    fn transform(&self, event: &icalendar::Event) -> Option<icalendar::Event> {
+	let mut new_event = Event::new();
+	for (k, v) in event.properties().iter() {
+	    if !self.remove_set.contains(k) {
+		new_event.append_property(v.clone());
+	    }
+	}
+	return Some(new_event);
+    }
+}
+
+// --------------------------------------------------------------------------------
+
+struct ReplacePropEventProcessor {
+    property: String,
+    value: String,
+}
+
+impl ReplacePropEventProcessor {
+    fn new(property: String, value: String) -> Self {
+	Self {
+	    property,
+	    value,
+	}
+    }
+}
+
+impl EventProcessor for ReplacePropEventProcessor {
+    fn transform(&self, event: &icalendar::Event) -> Option<icalendar::Event> {
+	let mut new_event = Event::new();
+	for (k, v) in event.properties().iter() {
+	    if *k != self.property {
+		new_event.append_property(v.clone());
+	    }
+	}
+	new_event.add_property(&self.property, &self.value);
+	return Some(new_event);
+    }
+}
+
+// --------------------------------------------------------------------------------
+
+struct CalBuilder<'a> {
+    event_replacement_strategy: &'a dyn EventReplacementStrategy,
     components: Vec<CalendarComponent>,
     id_map: HashMap<String, usize>,
     name: Option<String>,
@@ -63,9 +164,10 @@ struct CalBuilder {
     timezone: Option<String>,
 }
 
-impl CalBuilder {
-    fn new() -> Self {
+impl<'a> CalBuilder<'a> {
+    fn new(event_replacement_strategy: &'a dyn EventReplacementStrategy) -> Self {
 	Self {
+	    event_replacement_strategy,
 	    components: vec![],
 	    id_map: HashMap::new(),
 	    name: None,
@@ -97,6 +199,33 @@ impl CalBuilder {
 	return output_cal;
     }
 
+    fn calendar(self, event_processor: &dyn EventProcessor) -> Calendar {
+	let mut output_cal = self.empty_calendar();
+
+	for component in self.components {
+	    let retain = if let CalendarComponent::Event(_) = component {
+		event_processor.filter(&component.as_event().unwrap())
+	    } else { true };
+
+	    if retain {
+		let preserve = match component {
+		    CalendarComponent::Event(ref ev) => {
+			match event_processor.transform(&ev) {
+			    None     => true,
+			    Some(ev) => { output_cal.push(CalendarComponent::Event(ev));
+					  false},
+			}
+		    },
+		    _ => true,
+		};
+		if preserve {
+		    output_cal.push(component);
+		}
+	    }
+	}
+	return output_cal;
+    }
+
     fn process_stdin(&mut self) {
 	let stdin = stdin();
 	let mut input = String::new();
@@ -108,6 +237,11 @@ impl CalBuilder {
             input.push_str(&line);
             input.push('\n');
 	}
+	self.process(&input);
+    }
+
+    fn process_file(&mut self, filename: &str) {
+	let input = read_to_string(filename).unwrap();
 	self.process(&input);
     }
 
@@ -127,7 +261,7 @@ impl CalBuilder {
 			    let refcell = &mut self.components[index];
 
 			    let to_replace = if let CalendarComponent::Event(old_event) = refcell {
-				must_replace(event, &old_event)
+				self.event_replacement_strategy.must_replace(event, &old_event)
 			    } else { false };
 
 			    if to_replace {
@@ -149,12 +283,18 @@ impl CalBuilder {
     }
 }
 
+// --------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------
+
 fn main() {
     let cli = Cli::parse();
-    let mut output = CalBuilder::new();
 
-    let ev_filter = &ev_default_filter;
-    let ev_transform = &ev_default_transform;
+    let mut output = CalBuilder::new(&DefaultEventReplacementStrategy{});
+    let default_event_processor: &dyn EventProcessor = &DefaultEventProcessor{};
+
+    if let Some(ref input_file) = cli.input {
+	output.process_file(input_file);
+    }
 
     if !atty::is(Stream::Stdin) {
 	output.process_stdin();
@@ -163,38 +303,27 @@ fn main() {
     match &cli.command {
 	Commands::Cat { files } => {
 	    for file in files {
-		let input = read_to_string(file).unwrap();
-		output.process(&input);
+		output.process_file(&file);
 	    }
+	    // Produce output
+	    cli.print_calendar(&output.calendar(default_event_processor));
+	}
+
+	Commands::RemoveProp { properties } => {
+	    let mut properties_set = HashSet::new();
+	    for prop in properties {
+		properties_set.insert(prop);
+	    }
+	    let event_processor = RemovePropEventProcessor::new(properties_set);
+	    // Produce output
+	    cli.print_calendar(&output.calendar(&event_processor));
+	}
+
+	Commands::SetProp { property, value } => {
+	    let event_processor = ReplacePropEventProcessor::new(property.clone(), value.clone());
+	    // Produce output
+	    cli.print_calendar(&output.calendar(&event_processor));
 	}
     }
-
-    // Produce output
-
-    let mut output_cal = output.empty_calendar();
-
-    for component in output.components {
-	let retain = if let CalendarComponent::Event(_) = component {
-	    ev_filter(&component.as_event().unwrap())
-	} else { true };
-
-	if retain {
-	    let preserve = match component {
-		CalendarComponent::Event(ref ev) => {
-		    match ev_transform(&ev) {
-			None     => true,
-			Some(ev) => { output_cal.push(CalendarComponent::Event(ev));
-			false},
-		    }
-		},
-		_ => true,
-	    };
-	    if preserve {
-		output_cal.push(component);
-	    }
-	}
-    }
-
-    println!("{}", output_cal);
 }
 
