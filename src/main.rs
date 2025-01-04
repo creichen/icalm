@@ -1,6 +1,6 @@
 use atty::Stream;
 use clap::{Parser, Subcommand};
-use std::{collections::{HashMap, HashSet}, fs::{read_to_string, File}, io::{stdin, Write}};
+use std::{collections::{HashMap, HashSet}, fs::{read_to_string, File}, io::{self, Write}};
 use icalendar::{Calendar, CalendarComponent, Component, Event};
 //use colored::Colorize;
 
@@ -57,6 +57,10 @@ enum Commands {
 	/// Properties to remove
         #[arg(required = true)]
         properties: Vec<String>,
+    },
+
+    /// Print a list of all properties used in at least one event
+    Prop {
     },
 
     /// Replace the value of one property by a constant string
@@ -227,16 +231,7 @@ impl<'a> CalBuilder<'a> {
     }
 
     fn process_stdin(&mut self) {
-	let stdin = stdin();
-	let mut input = String::new();
-	for line in stdin.lines() {
-            let line = line.expect("Stdin broken");
-            // if line.trim().is_empty() {
-	    // 	continue; // Ignore empty lines
-            // }
-            input.push_str(&line);
-            input.push('\n');
-	}
+	let input = io::read_to_string(io::stdin()).unwrap();
 	self.process(&input);
     }
 
@@ -323,6 +318,10 @@ fn main() {
 	    let event_processor = ReplacePropEventProcessor::new(property.clone(), value.clone());
 	    // Produce output
 	    cli.print_calendar(&output.calendar(&event_processor));
+	}
+
+	Commands::Prop { } => {
+	    todo!("WIP");
 	}
     }
 }
