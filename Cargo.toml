@@ -1,0 +1,10 @@
+[package]
+name = "icalm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.23", features = ["derive"] }
+icalendar = "0.16"
+atty = "0.2"
+colored = "2.2"
