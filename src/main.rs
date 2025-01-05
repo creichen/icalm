@@ -59,6 +59,13 @@ enum Commands {
         properties: Vec<String>,
     },
 
+    /// From all events, remove all properties EXCEPT for the specified properties (SUMMARY, LOCATION, STATUS, ...)
+    KeepProp {
+	/// Properties to remove
+        #[arg(required = true)]
+        properties: Vec<String>,
+    },
+
     /// Print a list of all properties used in at least one event
     Prop {
     },
@@ -105,13 +112,20 @@ impl EventProcessor for  DefaultEventProcessor {}
 // --------------------------------------------------------------------------------
 
 struct RemovePropEventProcessor<'a> {
-    remove_set: HashSet<&'a String>,
+    properties_set: HashSet<&'a String>,
+    keep: bool,  // If true, keep ONLY the elements contained in the set
 }
 
 impl<'a> RemovePropEventProcessor<'a> {
-    fn new(remove_set: HashSet<&'a String>) -> Self {
+    fn new(properties: &'a [String], keep: bool) -> Self {
+	let mut properties_set = HashSet::new();
+	for prop in properties {
+	    properties_set.insert(prop);
+	}
+
 	Self {
-	    remove_set
+	    keep,
+	    properties_set,
 	}
     }
 }
@@ -120,7 +134,7 @@ impl<'a> EventProcessor for RemovePropEventProcessor<'a> {
     fn transform(&self, event: &icalendar::Event) -> Option<icalendar::Event> {
 	let mut new_event = Event::new();
 	for (k, v) in event.properties().iter() {
-	    if !self.remove_set.contains(k) {
+	    if self.keep == self.properties_set.contains(k) {
 		new_event.append_property(v.clone());
 	    }
 	}
@@ -169,13 +183,13 @@ struct CalBuilder<'a> {
 }
 
 impl<'a> CalBuilder<'a> {
-    fn new(event_replacement_strategy: &'a dyn EventReplacementStrategy) -> Self {
+    fn new(event_replacement_strategy: &'a dyn EventReplacementStrategy, cli: &Cli) -> Self {
 	Self {
 	    event_replacement_strategy,
 	    components: vec![],
 	    id_map: HashMap::new(),
-	    name: None,
-	    description: None,
+	    name: cli.name.clone(),
+	    description: cli.description.clone(),
 	    timezone: None,
 	}
     }
@@ -241,37 +255,58 @@ impl<'a> CalBuilder<'a> {
     }
 
     fn process(&mut self, input: &str) {
+	// For removing duplicate TZIDs
+	let mut tzid_set = HashSet::new();
+
 	if input.len() > 0 {
 	    let parsed_calendar: Calendar = input.parse().unwrap();
 
 	    self.or_calendar(&parsed_calendar);
 
 	    for component in &parsed_calendar.components {
-		if let CalendarComponent::Event(event) = component {
+		match component {
+		    CalendarComponent::Event(event) => {
+			if let Some(uid) = event.get_uid() {
+			    let uid = uid.to_string();
+			    if let Some(&index) = self.id_map.get(&uid) {
+				// Already saw this UID?
+				let refcell = &mut self.components[index];
 
-		    if let Some(uid) = event.get_uid() {
-			let uid = uid.to_string();
-			if let Some(&index) = self.id_map.get(&uid) {
-			    // Already saw this UID?
-			    let refcell = &mut self.components[index];
+				let to_replace = if let CalendarComponent::Event(old_event) = refcell {
+				    self.event_replacement_strategy.must_replace(event, &old_event)
+				} else { false };
 
-			    let to_replace = if let CalendarComponent::Event(old_event) = refcell {
-				self.event_replacement_strategy.must_replace(event, &old_event)
-			    } else { false };
-
-			    if to_replace {
-				*refcell = component.clone();
+				if to_replace {
+				    *refcell = component.clone();
+				}
+			    } else {
+				// Fresh UID
+				self.id_map.insert(uid, self.components.len());
+				self.components.push(component.clone());
 			    }
 			} else {
-			    // Fresh UID
-			    self.id_map.insert(uid, self.components.len());
+			    eprintln!("Calendar event without UID; skipping");
+			}},
+		    CalendarComponent::Other(other) => {
+			// Remove duplicate TZIDs
+			let preserve: bool = if other.component_kind() == "VTIMEZONE" {
+			    //eprintln!("{:?}", other.property_value("TZID"));
+			    if let Some(tzid) = other.property_value("TZID") {
+				if tzid_set.contains(tzid) {
+				    false
+				} else {
+				    tzid_set.insert(tzid);
+				    true
+				}
+			    } else { true }
+			} else { true };
+			if preserve {
 			    self.components.push(component.clone());
 			}
-		    } else {
-			eprintln!("Calendar event without UID; skipping");
+		    },
+		    _ => {
+			self.components.push(component.clone());
 		    }
-		} else {
-		    self.components.push(component.clone());
 		}
 	    }
 	}
@@ -284,7 +319,7 @@ impl<'a> CalBuilder<'a> {
 fn main() {
     let cli = Cli::parse();
 
-    let mut output = CalBuilder::new(&DefaultEventReplacementStrategy{});
+    let mut output = CalBuilder::new(&DefaultEventReplacementStrategy{}, &cli);
     let default_event_processor: &dyn EventProcessor = &DefaultEventProcessor{};
 
     if let Some(ref input_file) = cli.input {
@@ -304,12 +339,14 @@ fn main() {
 	    cli.print_calendar(&output.calendar(default_event_processor));
 	}
 
+	Commands::KeepProp { properties } => {
+	    let event_processor = RemovePropEventProcessor::new(properties, true);
+	    // Produce output
+	    cli.print_calendar(&output.calendar(&event_processor));
+	}
+
 	Commands::RemoveProp { properties } => {
-	    let mut properties_set = HashSet::new();
-	    for prop in properties {
-		properties_set.insert(prop);
-	    }
-	    let event_processor = RemovePropEventProcessor::new(properties_set);
+	    let event_processor = RemovePropEventProcessor::new(properties, false);
 	    // Produce output
 	    cli.print_calendar(&output.calendar(&event_processor));
 	}
@@ -321,7 +358,18 @@ fn main() {
 	}
 
 	Commands::Prop { } => {
-	    todo!("WIP");
+	    // Produce output
+	    let mut properties_set = HashSet::new();
+	    for component in output.components {
+		if let CalendarComponent::Event(event) = component {
+		    for prop in event.properties().keys() {
+			if !properties_set.contains(prop) {
+			    println!("{}", prop);
+			    properties_set.insert(prop.clone());
+			}
+		    }
+		}
+	    }
 	}
     }
 }
