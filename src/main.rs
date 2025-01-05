@@ -70,6 +70,13 @@ enum Commands {
     Prop {
     },
 
+    /// Limit the number of events to report
+    Limit {
+	/// Maximal number of events
+        #[arg(required = true)]
+        max: usize,
+    },
+
     /// Replace the value of one property by a constant string
     SetProp {
         /// Property to replace (e.g., "SUMMARY")
@@ -80,23 +87,34 @@ enum Commands {
         #[arg(required = true)]
         value: String,
     },
+
+    /// Replace the name of one time zone by another WITHOUT altering the time.  This is intended for fixing broken ical files.
+    TzSubst {
+        /// Original zone (e.g., "Greenwich")
+        #[arg(required = true)]
+        from_tz: String,
+
+        /// Substitute (e.g., "UTC")
+        #[arg(required = true)]
+        to_tz: String,
+    },
 }
 
 // --------------------------------------------------------------------------------
 trait EventReplacementStrategy {
     /// Should the new_event replace the old_event?  Both have the same UID, and new_event was observed later.
-    fn must_replace(&self, _new_event: &icalendar::Event, _old_event: &icalendar::Event) -> bool {
+    fn must_replace(&mut self, _new_event: &icalendar::Event, _old_event: &icalendar::Event) -> bool {
 	true
     }
 }
 
 trait EventProcessor {
     /// Should this event be preserved? (Default filter)
-    fn filter(&self, _event: &icalendar::Event) -> bool {
+    fn filter(&mut self, _event: &icalendar::Event) -> bool {
 	true
     }
     /// Should this event be transformed?  Return update, otherwise preserve
-    fn transform(&self, _event: &icalendar::Event) -> Option<icalendar::Event> {
+    fn transform(&mut self, _event: &icalendar::Event) -> Option<icalendar::Event> {
 	None
     }
 }
@@ -131,7 +149,7 @@ impl<'a> RemovePropEventProcessor<'a> {
 }
 
 impl<'a> EventProcessor for RemovePropEventProcessor<'a> {
-    fn transform(&self, event: &icalendar::Event) -> Option<icalendar::Event> {
+    fn transform(&mut self, event: &icalendar::Event) -> Option<icalendar::Event> {
 	let mut new_event = Event::new();
 	for (k, v) in event.properties().iter() {
 	    if self.keep == self.properties_set.contains(k) {
@@ -159,7 +177,7 @@ impl ReplacePropEventProcessor {
 }
 
 impl EventProcessor for ReplacePropEventProcessor {
-    fn transform(&self, event: &icalendar::Event) -> Option<icalendar::Event> {
+    fn transform(&mut self, event: &icalendar::Event) -> Option<icalendar::Event> {
 	let mut new_event = Event::new();
 	for (k, v) in event.properties().iter() {
 	    if *k != self.property {
@@ -173,8 +191,76 @@ impl EventProcessor for ReplacePropEventProcessor {
 
 // --------------------------------------------------------------------------------
 
+// Substitute time zone name in events
+struct TzSubstEventProcessor {
+    from_tz: String,
+    to_tz: String,
+}
+
+impl TzSubstEventProcessor {
+    fn new(from_tz: String, to_tz: String) -> Self {
+	Self {
+	    from_tz,
+	    to_tz,
+	}
+    }
+}
+
+impl EventProcessor for TzSubstEventProcessor {
+    fn transform(&mut self, event: &icalendar::Event) -> Option<icalendar::Event> {
+	let mut new_event = Event::new();
+	for (_, v) in event.properties().iter() {
+	    let to_replace =
+		if let Some(tzid) = v.params().get("TZID") {
+		    if tzid.value() == self.from_tz {
+			true
+		    } else { false }
+		} else { false };
+
+	    if to_replace {
+		let params = v.params().iter().map(
+		    |(k, p)| if k == "TZID" { icalendar::Parameter::new(k, &self.to_tz) } else { p.clone() });
+		let mut new_prop = icalendar::Property::new(v.key(), v.value());
+		for param in params {
+		    new_prop.append_parameter(param);
+		}
+		new_event.append_property(new_prop);
+	    } else {
+		new_event.append_property(v.clone());
+	    }
+	}
+	return Some(new_event);
+    }
+}
+
+// --------------------------------------------------------------------------------
+
+struct LimitEventProcessor {
+    remaining: usize,
+}
+
+impl LimitEventProcessor {
+    fn new(remaining: usize) -> Self {
+	Self {
+	    remaining,
+	}
+    }
+}
+
+impl EventProcessor for LimitEventProcessor {
+    fn filter(&mut self, _event: &icalendar::Event) -> bool {
+	if self.remaining > 0 {
+	    self.remaining -= 1;
+	    return true;
+	}
+	return false;
+    }
+}
+
+// --------------------------------------------------------------------------------
+
 struct CalBuilder<'a> {
-    event_replacement_strategy: &'a dyn EventReplacementStrategy,
+    event_replacement_strategy: &'a mut dyn EventReplacementStrategy,
     components: Vec<CalendarComponent>,
     id_map: HashMap<String, usize>,
     name: Option<String>,
@@ -183,7 +269,7 @@ struct CalBuilder<'a> {
 }
 
 impl<'a> CalBuilder<'a> {
-    fn new(event_replacement_strategy: &'a dyn EventReplacementStrategy, cli: &Cli) -> Self {
+    fn new(event_replacement_strategy: &'a mut dyn EventReplacementStrategy, cli: &Cli) -> Self {
 	Self {
 	    event_replacement_strategy,
 	    components: vec![],
@@ -217,7 +303,7 @@ impl<'a> CalBuilder<'a> {
 	return output_cal;
     }
 
-    fn calendar(self, event_processor: &dyn EventProcessor) -> Calendar {
+    fn calendar(self, event_processor: &mut dyn EventProcessor) -> Calendar {
 	let mut output_cal = self.empty_calendar();
 
 	for component in self.components {
@@ -319,8 +405,10 @@ impl<'a> CalBuilder<'a> {
 fn main() {
     let cli = Cli::parse();
 
-    let mut output = CalBuilder::new(&DefaultEventReplacementStrategy{}, &cli);
-    let default_event_processor: &dyn EventProcessor = &DefaultEventProcessor{};
+    let mut default_replacement_strategy = DefaultEventReplacementStrategy{};
+    let mut output = CalBuilder::new(&mut default_replacement_strategy, &cli);
+    let mut default_event_processor_data = DefaultEventProcessor{};
+    let default_event_processor: &mut dyn EventProcessor = &mut default_event_processor_data;
 
     if let Some(ref input_file) = cli.input {
 	output.process_file(input_file);
@@ -340,21 +428,27 @@ fn main() {
 	}
 
 	Commands::KeepProp { properties } => {
-	    let event_processor = RemovePropEventProcessor::new(properties, true);
+	    let mut event_processor = RemovePropEventProcessor::new(properties, true);
 	    // Produce output
-	    cli.print_calendar(&output.calendar(&event_processor));
+	    cli.print_calendar(&output.calendar(&mut event_processor));
 	}
 
 	Commands::RemoveProp { properties } => {
-	    let event_processor = RemovePropEventProcessor::new(properties, false);
+	    let mut event_processor = RemovePropEventProcessor::new(properties, false);
 	    // Produce output
-	    cli.print_calendar(&output.calendar(&event_processor));
+	    cli.print_calendar(&output.calendar(&mut event_processor));
 	}
 
 	Commands::SetProp { property, value } => {
-	    let event_processor = ReplacePropEventProcessor::new(property.clone(), value.clone());
+	    let mut event_processor = ReplacePropEventProcessor::new(property.clone(), value.clone());
 	    // Produce output
-	    cli.print_calendar(&output.calendar(&event_processor));
+	    cli.print_calendar(&output.calendar(&mut event_processor));
+	}
+
+	Commands::TzSubst { from_tz, to_tz } => {
+	    let mut event_processor = TzSubstEventProcessor::new(from_tz.clone(), to_tz.clone());
+	    // Produce output
+	    cli.print_calendar(&output.calendar(&mut event_processor));
 	}
 
 	Commands::Prop { } => {
@@ -371,6 +465,13 @@ fn main() {
 		}
 	    }
 	}
+
+	Commands::Limit { max } => {
+	    let mut event_processor = LimitEventProcessor::new(*max);
+	    // Produce output
+	    cli.print_calendar(&output.calendar(&mut event_processor));
+	}
+
     }
 }
 

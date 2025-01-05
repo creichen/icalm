@@ -1,9 +1,12 @@
-# icalm: ical file merging and mangling tool
+# icalm: ical (.ics) file merging and mangling tool
 
-This tool processes `ical` files:
-- `cat`: concatenation (incl. replacing duplicate events)
-- `remove-prop`: strip out properties
+This tool processes `ics` (iCal) files:
+- `cat`: concatenation (for duplicate events, report only the last occurrence)
+- `remove-prop`: strip out blocklisted properties
+- `keep-prop`: strip out properties unless passlisted
 - `set-prop`: overwrite properties
+- `tz-subst`: substitute timezone names
+- `limit`: bound number of events in output
 
 ## Examples
 
@@ -22,14 +25,14 @@ Piplining:
 
 ## Motivation
 
-`ical` (icalendar, iCal) files seem to be the only unversal (albeit
+`ics` (icalendar, iCal) files seem to be the only unversal (albeit
 read-only) calendar view supported by all major calendar providers.
 
-However, `ical` files aren't always in the ideal format for export to
+However, `ics` files aren't always in the ideal format for export to
 e.g. Google Calendar or Outlook:
-- Calendars may be stored in multiple `ical` files (e.g., by
+- Calendars may be stored in multiple `ics` files (e.g., by
   `radicale`), while Google Calendar and Outlook will import only a
-  single `ical` link at a time
+  single `is` link at a time
 - Calendars may store information that we don't want to make public
   (e.g., phone numbers or Zoom links).
 
